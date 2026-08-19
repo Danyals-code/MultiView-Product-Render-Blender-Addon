@@ -1,0 +1,34 @@
+name: Build add-on zip
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build zip
+        run: zip -r multiview_product_renderer.zip multiview_product_renderer -x '*__pycache__*' '*.pyc'
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: multiview_product_renderer
+          path: multiview_product_renderer.zip
+
+      - name: Attach zip to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" multiview_product_renderer.zip \
+            --title "$GITHUB_REF_NAME" --generate-notes \
+          || gh release upload "$GITHUB_REF_NAME" multiview_product_renderer.zip --clobber
