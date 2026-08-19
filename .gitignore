@@ -4,5 +4,9 @@ __pycache__/
 *.blend2
 /dist/
 /renders/
+
+# Local STEP files for manual testing - keep the folder and its README, ignore the CAD
+/test_files/*
+!/test_files/README.md
 .DS_Store
 Thumbs.db
