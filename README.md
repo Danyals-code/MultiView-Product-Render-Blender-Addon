@@ -8,7 +8,7 @@ view in one click, with predictable file names like `AA_01_Widget_Front_clay.png
 
 - **Blender:** 4.0 and newer
 - **Panel location:** `3D Viewport → Sidebar (N key) → MultiView`
-- **Version:** 1.2.0
+- **Version:** 1.3.0
 
 ---
 
@@ -65,7 +65,10 @@ C:\Program Files\FreeCAD 0.21\bin\freecadcmd.exe
 ```
 
 The add-on shells out to FreeCAD, tessellates each solid into a mesh, writes a temporary
-OBJ, and imports that. Nothing is left behind in your FreeCAD install.
+OBJ, and imports that. Nothing is left behind in your FreeCAD install, and the scratch
+directory is removed even if you cancel. FreeCAD is run with its standard input closed, so
+a build that stops to ask a question fails immediately instead of stalling the import.
+Any single conversion is given 15 minutes before it is stopped.
 
 **STEPper route**: if you own the STEPper add-on, install and enable it; MultiView detects
 and uses its import operator automatically.
@@ -79,7 +82,7 @@ The sidebar is laid out in the order you should use it.
 ### 1. Scene Setup
 
 Pick a lighting preset and a background, then **Apply Scene Setup**. This builds an
-`MV_Lights` collection and sets the world background.
+`MV_Lighting` collection and sets the world background.
 
 | Lighting preset | Look |
 | --- | --- |
@@ -98,15 +101,46 @@ Add one or more STEP files to the list and click **Import STEP Files**. Each fil
 its own collection under `MV_Products`. That grouping is what the batch renderer iterates
 over.
 
+Import runs in the background: the status bar shows `MultiView: 3/12 housing.step
+(converting)`, Blender stays responsive, and **Esc** cancels after the file in flight.
+Files that fail are skipped rather than stopping the batch, and FreeCAD's own error
+message is reported instead of a generic failure -- run `Window > Toggle System Console`
+to see the full list.
+
 You can also click **Add Empty Product Collection** and drag existing meshes into it, which
 is how you use MultiView with geometry that didn't come from STEP.
 
-**Standardize Products** makes everything comparable across a batch:
+**Fit on Import** (on by default) does this automatically: as each STEP file lands, the
+product is uniformly scaled so its largest dimension equals **Target Size** (default
+`1.0 m`, i.e. it fits inside a 1x1x1 m cube) and its bounding box is centred on the world
+origin. Turn it off if you want to place and scale products yourself.
 
-- **Recenter**: moves each product's geometry to the world origin.
+**Standardize Products** applies the same fit to everything already under `MV_Products`,
+which is what you want after dragging in your own meshes or importing with the option off:
+
+- **Recenter**: moves each product's bounding box centre onto the world origin.
 - **Rescale**: uniformly scales each product so its largest dimension equals **Target
-  Size** (default `1.0 m`). This is what makes a tiny screw and a large housing frame
-  identically in the final images.
+  Size**. This is what makes a tiny screw and a large housing frame read identically in
+  the final images.
+
+- **Auto Smooth**: fixes the faceted look a tessellated CAD import arrives with. FreeCAD
+  writes per-face normals that Blender keeps as custom split normals, and some Blender
+  versions also mark most edges sharp on import; either one pins the flat shading no matter
+  what you set. This clears both, then re-derives hard edges from the angle between faces
+  (**Smooth Angle**, default 30 degrees -- raise it to keep fewer hard edges, lower it to
+  keep more).
+
+Both operate on the product as one rigid assembly, so multi-part STEP files keep their
+parts in the right places relative to each other.
+
+Sharpness is baked into the mesh rather than left to a *Smooth by Angle* modifier, so a
+large batch costs nothing extra at render time. Running Standardize again is safe -- it is
+idempotent.
+
+Afterwards the transform is baked down: scale values read `1.0` and every object origin sits
+on the world origin, so the product rotates about its own centre and the N panel is clean.
+Geometry does not move during that step. Objects on multi-user or linked data cannot be
+edited by Blender, so those keep their transform and are counted in the status message.
 
 ### 3. Cameras / Views
 
@@ -124,7 +158,12 @@ Choose a view set and click **Build Cameras**. Cameras land in `MV_Cameras`, nam
 CAD exports usually land on `+X` (the default); Blender's own convention is `-Y`. Getting
 this right is what makes the "Front" render actually the front.
 
-**Framing Padding** is the margin around the product in frame. `1.4` leaves 40% headroom.
+**Framing Padding** is the margin around the product in frame. `1.4` leaves 40% headroom
+on the tightest axis; `1.0` fits the product exactly to the frame edge. Framing accounts for
+your output resolution's aspect ratio, so a 16:9 or portrait render is not cropped.
+
+All orthographic views share one framing, and all perspective views share another, so a
+product reads at the same scale across the whole sheet rather than being re-fitted per view.
 
 Need an angle that isn't in the presets? Add a **Custom View** with an X/Y/Z direction
 vector and an ortho/perspective toggle, and it gets built alongside the rest.
@@ -177,7 +216,7 @@ The `AA_01` label is controlled by three fields:
 | --- | --- |
 | `MV_Products` | One child collection per product. This is what gets iterated and isolated. |
 | `MV_Cameras` | Generated cameras, named `MV_Cam_<View>`. |
-| `MV_Lights` | The lights from the active lighting preset. |
+| `MV_Lighting` | The lights from the active lighting preset. |
 
 Rebuilding cameras or lighting clears and regenerates only that collection. Your products
 are never touched.
