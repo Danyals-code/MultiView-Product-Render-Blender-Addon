@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MultiView Product Renderer",
     "author": "MultiView",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > MultiView",
     "description": "Import STEP files, set up cameras and 3-point lighting, batch render products across views.",
@@ -13,6 +13,8 @@ import os
 import math
 import subprocess
 import tempfile
+import shutil
+import time
 from mathutils import Vector, Matrix
 from bpy.props import (
     StringProperty, EnumProperty, BoolProperty, FloatProperty,
@@ -87,7 +89,9 @@ GUIDE_LINES = [
     "1. Scene Setup: pick a lighting preset and background, then Apply.",
     "2. Import: point to FreeCAD or STEPper, add STEP files, click Import.",
     "   Each file becomes a collection under MV_Products.",
-    "   You can also create empty product collections and drop meshes in.",
+    "   Fit on Import scales each one into a Target Size cube at the origin.",
+    "   You can also create empty product collections and drop meshes in,",
+    "   then click Standardize Products to fit them the same way.",
     "3. Cameras: pick a view set and front axis, click Build.",
     "4. Render: set output folder, mode (full/clay/both), starting index,",
     "   then Render All. Files are named PREFIX_NN_Product_View.",
@@ -226,7 +230,8 @@ class MV_Settings(PropertyGroup):
 
     recenter: BoolProperty(
         name="Recenter",
-        description="For each product: origin to 3D cursor, then geometry to origin (product ends up at world origin)",
+        description="Move each product's bounding box centre onto the world origin, "
+                    "keeping its parts in their relative positions",
         default=True,
     )
     rescale: BoolProperty(
@@ -238,6 +243,24 @@ class MV_Settings(PropertyGroup):
         name="Target Size",
         description="Max dimension (m) each product is scaled to fit within",
         default=1.0, min=0.0001, soft_max=10.0,
+    )
+    auto_smooth: BoolProperty(
+        name="Auto Smooth",
+        description="Clear the sharp edges and split normals a CAD tessellation "
+                    "imports with, then shade smooth under the angle threshold",
+        default=True,
+    )
+    smooth_angle: FloatProperty(
+        name="Smooth Angle",
+        description="Faces meeting at a sharper angle than this keep a hard edge",
+        default=math.radians(30.0), min=0.0, max=math.radians(180.0),
+        subtype='ANGLE',
+    )
+    fit_on_import: BoolProperty(
+        name="Fit on Import",
+        description="Straight after importing, scale each product to fit inside a cube of "
+                    "Target Size and centre it on the world origin",
+        default=True,
     )
 
     show_products_list: BoolProperty(default=False)
@@ -308,38 +331,185 @@ def collection_meshes(coll):
     return [o for o in coll.all_objects if o.type in {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT'}]
 
 
-def recenter_collection(coll):
+def collection_roots(coll):
+    """Objects in coll whose parent lives outside it. Transforming these moves
+    the whole assembly once; children follow through their parent."""
+    members = set(coll.all_objects)
+    return [o for o in members if o.parent is None or o.parent not in members]
+
+
+def fit_collection(coll, target_size=None, recenter=True):
+    """Uniformly scale a product so its bounding box fits inside a cube of
+    target_size, and optionally move that box onto the world origin.
+
+    Pass target_size=None to only recenter. Returns False if the collection
+    holds no geometry. The whole product is treated as one rigid assembly, so
+    parts keep their relative positions.
+    """
     objs = collection_meshes(coll)
     if not objs:
-        return
-    original_cursor = tuple(bpy.context.scene.cursor.location)
-    bpy.context.scene.cursor.location = (0.0, 0.0, 0.0)
+        return False
+
+    center, size = bbox_of(objs)
+    factor = 1.0
+    if target_size:
+        max_dim = max(size.x, size.y, size.z)
+        if max_dim > 1e-9:
+            factor = target_size / max_dim
+
+    dest = Vector((0, 0, 0)) if recenter else center
+    if abs(factor - 1.0) < 1e-9 and (dest - center).length < 1e-9:
+        return True
+
+    xform = (Matrix.Translation(dest)
+             @ Matrix.Scale(factor, 4)
+             @ Matrix.Translation(-center))
+    for obj in collection_roots(coll):
+        obj.matrix_world = xform @ obj.matrix_world
+    return True
+
+
+def parent_depth(obj):
+    depth, parent = 0, obj.parent
+    while parent is not None:
+        depth += 1
+        parent = parent.parent
+    return depth
+
+
+def push_empty_scale_down(coll):
+    """Empties can carry scale but hold no data to bake it into, so a parented
+    assembly would keep its fit scale stuck on the root.
+
+    Walk the hierarchy top-down clearing each empty's scale while pinning its
+    children's world matrices, which slides the scale onto the meshes at the
+    leaves where transform_apply can reach it.
+    """
+    empties = [o for o in coll.all_objects if o.type == 'EMPTY']
+    for empty in sorted(empties, key=parent_depth):
+        if all(abs(v - 1.0) < 1e-9 for v in empty.scale):
+            continue
+        bpy.context.view_layer.update()
+        pinned = [(c, c.matrix_world.copy()) for c in empty.children]
+        empty.scale = (1.0, 1.0, 1.0)
+        bpy.context.view_layer.update()
+        for child, world in pinned:
+            child.matrix_world = world
+
+
+def bake_product(coll, apply_scale=True, origin_to_world=True):
+    """Fold a fitted product's transform into its data: scale values back to
+    1.0, and every object origin parked on the world origin.
+
+    Geometry does not move -- this only changes where the transform is stored,
+    so the product keeps the position and size fit_collection gave it while
+    reporting clean values in the N panel.
+
+    Blender refuses to edit multi-user or linked data, so those objects are
+    returned as skipped rather than silently half-processed.
+    """
+    ctx = bpy.context
+    members = collection_meshes(coll)
+    if not members:
+        return [], []
+    if ctx.mode != 'OBJECT':
+        return [], [o.name for o in members]
+
+    editable = [o for o in members
+                if o.name in ctx.view_layer.objects
+                and o.library is None
+                and o.data is not None
+                and o.data.library is None
+                and o.data.users == 1]
+    skipped = [o.name for o in members if o not in editable]
+    if not editable:
+        return [], skipped
+
+    if apply_scale:
+        push_empty_scale_down(coll)
+
+    ctx.view_layer.update()
+    cursor = ctx.scene.cursor
+    saved_cursor = cursor.location.copy()
+    cursor.location = (0.0, 0.0, 0.0)
     try:
-        for o in list(bpy.context.selected_objects):
-            o.select_set(False)
-        for o in objs:
-            o.select_set(True)
-        bpy.context.view_layer.objects.active = objs[0]
-        bpy.ops.object.origin_set(type='ORIGIN_CURSOR')
-        bpy.ops.object.origin_set(type='GEOMETRY_ORIGIN')
+        with ctx.temp_override(active_object=editable[0], object=editable[0],
+                               selected_objects=editable,
+                               selected_editable_objects=editable):
+            if apply_scale:
+                bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+            if origin_to_world:
+                bpy.ops.object.origin_set(type='ORIGIN_CURSOR')
     finally:
-        bpy.context.scene.cursor.location = original_cursor
+        cursor.location = saved_cursor
+    return [o.name for o in editable], skipped
 
 
-def collection_max_dim(coll):
-    objs = collection_meshes(coll)
-    if not objs:
-        return 0.0
-    _, size = bbox_of(objs)
-    return max(size.x, size.y, size.z, 1e-9)
+def smooth_product(coll, angle):
+    """Give a tessellated CAD import the shading it should have had.
 
+    A STEP tessellation arrives faceted twice over: FreeCAD writes per-face
+    normals that Blender keeps as custom split normals, and some Blender
+    versions additionally mark most edges sharp on import. Either one pins the
+    flat look no matter what shading you ask for, which is why the fix needs
+    clearing before smoothing rather than smoothing alone.
 
-def scale_collection(coll, factor, pivot=Vector((0, 0, 0))):
-    if abs(factor - 1.0) < 1e-9:
-        return
-    for obj in collection_meshes(coll):
-        obj.location = pivot + (obj.location - pivot) * factor
-        obj.scale = Vector((obj.scale.x * factor, obj.scale.y * factor, obj.scale.z * factor))
+    Sharpness is then re-derived from the angle between neighbouring faces and
+    baked into the mesh, rather than left to a Smooth by Angle modifier: a
+    batch here runs to millions of triangles and the modifier would be
+    re-evaluated on every render.
+
+    Returns (done, skipped) name lists.
+    """
+    ctx = bpy.context
+    meshes = [o for o in collection_meshes(coll) if o.type == 'MESH']
+    if not meshes:
+        return [], []
+    if ctx.mode != 'OBJECT':
+        return [], [o.name for o in meshes]
+
+    editable = [o for o in meshes
+                if o.name in ctx.view_layer.objects
+                and o.library is None
+                and o.data is not None
+                and o.data.library is None]
+    skipped = [o.name for o in meshes if o not in editable]
+    if not editable:
+        return [], skipped
+
+    for obj in editable:
+        me = obj.data
+        if me.has_custom_normals:
+            try:
+                with ctx.temp_override(object=obj, active_object=obj,
+                                       selected_objects=[obj],
+                                       selected_editable_objects=[obj]):
+                    bpy.ops.mesh.customdata_custom_splitnormals_clear()
+            except Exception:
+                pass
+        if len(me.edges):
+            me.edges.foreach_set("use_edge_sharp", [False] * len(me.edges))
+        if len(me.polygons):
+            me.polygons.foreach_set("use_smooth", [True] * len(me.polygons))
+        me.update()
+
+    with ctx.temp_override(object=editable[0], active_object=editable[0],
+                           selected_objects=editable,
+                           selected_editable_objects=editable):
+        if hasattr(bpy.ops.object, "shade_smooth_by_angle"):
+            bpy.ops.object.shade_smooth_by_angle(angle=angle)
+        else:
+            # Blender 4.0 kept auto smooth as a mesh property instead.
+            try:
+                bpy.ops.object.shade_smooth(use_auto_smooth=True,
+                                            auto_smooth_angle=angle)
+            except TypeError:
+                bpy.ops.object.shade_smooth()
+                for obj in editable:
+                    if hasattr(obj.data, "use_auto_smooth"):
+                        obj.data.use_auto_smooth = True
+                        obj.data.auto_smooth_angle = angle
+    return [o.name for o in editable], skipped
 
 
 def find_layer_coll(layer_coll, name):
@@ -377,14 +547,26 @@ def product_label(start_prefix, start_number, offset, per_letter):
     return f"{alpha_pair(base + bumps)}_{num:02d}"
 
 
+STEPPER_OPERATORS = (
+    "import_scene.occ_import_step",
+    "import_scene.occ",
+    "wm.stepper_import",
+    "import_scene.stepper",
+)
+
+# Wall-clock ceiling for one FreeCAD conversion. Generous, because Esc now
+# cancels an import that is genuinely wedged.
+FREECAD_TIMEOUT = 900.0
+
+
 def try_stepper_import(filepath):
-    candidates = [
-        "import_scene.occ_import_step",
-        "import_scene.occ",
-        "wm.stepper_import",
-        "import_scene.stepper",
-    ]
-    for op_path in candidates:
+    """True only if a STEPper-style operator actually reported success.
+
+    Blender operators signal failure by RETURNING {'CANCELLED'} rather than
+    raising, so the result set has to be inspected. Not doing that made AUTO
+    mode read a cancelled import as a success and skip the FreeCAD fallback.
+    """
+    for op_path in STEPPER_OPERATORS:
         module, func = op_path.split(".", 1)
         mod = getattr(bpy.ops, module, None)
         op = getattr(mod, func, None) if mod else None
@@ -392,8 +574,8 @@ def try_stepper_import(filepath):
             continue
         for kw in ("filepath", "filename"):
             try:
-                op(**{kw: filepath})
-                return True
+                if 'FINISHED' in op(**{kw: filepath}):
+                    return True
             except TypeError:
                 continue
             except Exception:
@@ -401,61 +583,213 @@ def try_stepper_import(filepath):
     return False
 
 
-def freecad_convert(step_path, freecad_exe, deflection):
+def freecad_prepare(step_path, freecad_exe, deflection):
+    """Write the conversion script for one STEP file. None if FreeCAD is not
+    configured. Nothing is launched yet."""
     if not freecad_exe or not os.path.isfile(freecad_exe):
         return None
     tmp_dir = tempfile.mkdtemp(prefix="mv_step_")
     obj_out = os.path.join(tmp_dir, os.path.splitext(os.path.basename(step_path))[0] + ".obj")
+    quoted_step = step_path.replace("\\", "\\\\").replace("'", "\'")
+    quoted_obj = obj_out.replace("\\", "\\\\").replace("'", "\'")
     script = (
         "import Import, MeshPart, FreeCAD\n"
-        f"Import.open(r'''{step_path}''')\n"
+        "Import.open('%s')\n" % quoted_step +
         "doc = FreeCAD.ActiveDocument\n"
         "meshes = []\n"
         "for obj in doc.Objects:\n"
         "    if hasattr(obj, 'Shape') and obj.Shape and not obj.Shape.isNull():\n"
         "        try:\n"
-        f"            meshes.append(MeshPart.meshFromShape(Shape=obj.Shape, LinearDeflection={deflection}, AngularDeflection=0.5, Relative=False))\n"
+        "            meshes.append(MeshPart.meshFromShape(Shape=obj.Shape, "
+        "LinearDeflection=%r, AngularDeflection=0.5, Relative=False))\n" % float(deflection) +
         "        except Exception as e:\n"
         "            print('mesh failed', obj.Name, e)\n"
         "if meshes:\n"
         "    m = meshes[0]\n"
         "    for extra in meshes[1:]:\n"
         "        m.addMesh(extra)\n"
-        f"    m.write(r'''{obj_out}''')\n"
+        "    m.write('%s')\n" % quoted_obj
     )
     script_path = os.path.join(tmp_dir, "convert.py")
     with open(script_path, "w", encoding="utf-8") as f:
         f.write(script)
+    return {"tmp_dir": tmp_dir, "obj": obj_out, "script": script_path,
+            "log": os.path.join(tmp_dir, "freecad.log"), "exe": freecad_exe,
+            "proc": None, "handle": None}
+
+
+def freecad_start(job):
+    """Launch freecadcmd without waiting on it.
+
+    stdin is closed rather than inherited: a FreeCAD build that stops to ask a
+    question used to sit there holding Blender hostage for the whole timeout.
+    Output goes to a file, not a pipe, so a chatty conversion cannot deadlock
+    against a pipe buffer nobody is draining while we poll.
+    """
+    handle = open(job["log"], "w", encoding="utf-8", errors="replace")
+    job["handle"] = handle
+    job["proc"] = subprocess.Popen(
+        [job["exe"], job["script"]],
+        stdin=subprocess.DEVNULL,
+        stdout=handle,
+        stderr=subprocess.STDOUT,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return job
+
+
+def freecad_running(job):
+    proc = job.get("proc")
+    return proc is not None and proc.poll() is None
+
+
+def freecad_collect(job):
+    """Reap a finished job: (obj path or None, whatever FreeCAD printed)."""
+    if job.get("handle") is not None:
+        job["handle"].close()
+        job["handle"] = None
+    log = ""
     try:
-        subprocess.run([freecad_exe, script_path], capture_output=True, text=True, timeout=300)
-    except Exception as e:
-        print("FreeCAD subprocess error:", e)
-        return None
-    return obj_out if os.path.isfile(obj_out) and os.path.getsize(obj_out) > 0 else None
+        with open(job["log"], "r", encoding="utf-8", errors="replace") as f:
+            log = f.read()
+    except OSError:
+        pass
+    obj = job["obj"]
+    if os.path.isfile(obj) and os.path.getsize(obj) > 0:
+        return obj, log
+    return None, log
+
+
+def kill_process_tree(proc):
+    """Stop the converter and anything it spawned.
+
+    proc.kill() only signals the immediate child. A launcher that re-execs
+    leaves the real worker alive, still holding the temp dir open, so a
+    cancelled import would leak its scratch directory every time.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    if os.name == 'nt':
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def freecad_cleanup(job):
+    kill_process_tree(job.get("proc"))
+    if job.get("handle") is not None:
+        job["handle"].close()
+        job["handle"] = None
+    # Windows keeps the log file locked for a moment after the writer dies.
+    tmp_dir = job["tmp_dir"]
+    for _ in range(5):
+        if not os.path.isdir(tmp_dir):
+            return
+        try:
+            shutil.rmtree(tmp_dir)
+            return
+        except OSError:
+            time.sleep(0.1)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def import_obj_file(path):
+    """FreeCAD works Z-up, so tell the OBJ importer that instead of letting it
+    apply its Y-up default and silently rotating every product 90 degrees."""
     if hasattr(bpy.ops.wm, "obj_import"):
-        bpy.ops.wm.obj_import(filepath=path)
+        try:
+            bpy.ops.wm.obj_import(filepath=path, forward_axis='Y', up_axis='Z')
+        except TypeError:
+            bpy.ops.wm.obj_import(filepath=path)
         return True
     if hasattr(bpy.ops.import_scene, "obj"):
-        bpy.ops.import_scene.obj(filepath=path)
+        try:
+            bpy.ops.import_scene.obj(filepath=path, axis_forward='Y', axis_up='Z')
+        except TypeError:
+            bpy.ops.import_scene.obj(filepath=path)
         return True
     return False
 
 
-def import_step(filepath, prefs):
-    before = set(bpy.data.objects)
-    ok = False
-    if prefs.step_import_mode in {'AUTO', 'STEPPER'}:
-        ok = try_stepper_import(filepath)
-    if not ok and prefs.step_import_mode in {'AUTO', 'FREECAD'}:
-        obj_path = freecad_convert(filepath, prefs.freecad_path, prefs.tessellation_deflection)
-        if obj_path:
-            ok = import_obj_file(obj_path)
-    if not ok:
-        return None
-    return list(set(bpy.data.objects) - before)
+PERSP_LENS = 50.0
+SENSOR_WIDTH = 36.0
+
+
+def image_aspect(scene):
+    """Effective pixel dimensions of the render, including pixel aspect."""
+    r = scene.render
+    rx = max(r.resolution_x * r.pixel_aspect_x, 1e-6)
+    ry = max(r.resolution_y * r.pixel_aspect_y, 1e-6)
+    return rx, ry
+
+
+def sensor_tangents(rx, ry, lens=PERSP_LENS, sensor=SENSOR_WIDTH):
+    """Half-FOV tangents on the image x and y axes, for sensor_fit='AUTO'.
+
+    Blender fits the sensor width to the LONGER image axis, so the shorter axis
+    sees a proportionally smaller sensor and a narrower field of view.
+    """
+    if rx >= ry:
+        sx, sy = sensor, sensor * ry / rx
+    else:
+        sx, sy = sensor * rx / ry, sensor
+    lens = max(lens, 1e-6)
+    return (sx * 0.5) / lens, (sy * 0.5) / lens
+
+
+def view_extents(basis, center, corners):
+    """Where the product sits in one camera's frame: half-width, half-height,
+    how far it reaches toward the camera, and the per-corner coordinates.
+
+    Only the rotation of `basis` matters -- sliding a camera along its own view
+    axis never changes where a point lands horizontally or vertically in frame.
+    """
+    right, up, back = basis.col[0].xyz, basis.col[1].xyz, basis.col[2].xyz
+    ex = ey = 0.0
+    depth = -float("inf")
+    local = []
+    for p in corners:
+        rel = p - center
+        cx, cy, cz = abs(rel.dot(right)), abs(rel.dot(up)), rel.dot(back)
+        ex = max(ex, cx)
+        ey = max(ey, cy)
+        depth = max(depth, cz)
+        local.append((cx, cy, cz))
+    return ex, ey, depth, local
+
+
+def ortho_span(ex, ey, rx, ry):
+    """Half-extent ortho_scale has to cover.
+
+    ortho_scale spans the LONGER image axis, so the shorter axis gets
+    proportionally less room. Ignoring that is what made the old
+    `ortho_scale = max_dim * pad` crop every view at 16:9.
+    """
+    if rx >= ry:
+        return max(ex, ey * rx / ry)
+    return max(ey, ex * ry / rx)
+
+
+def persp_distance(local, tan_x, tan_y, pad):
+    """Closest distance at which every corner still clears both frame edges."""
+    distance = 0.0
+    for cx, cy, cz in local:
+        distance = max(distance, pad * cx / tan_x + cz, pad * cy / tan_y + cz)
+    return distance
 
 
 def build_cameras(context):
@@ -470,10 +804,15 @@ def build_cameras(context):
         objs = [o for o in bpy.data.objects if o.type == 'MESH']
 
     center, size = bbox_of(objs)
-    max_dim = max(size.x, size.y, size.z, 1e-3)
-    pad = settings.frame_padding_factor
-    distance = max_dim * pad * 2.0
-    ortho_scale = max_dim * pad
+    half = size * 0.5
+    corners = [center + Vector((x, y, z))
+               for x in (-half.x, half.x)
+               for y in (-half.y, half.y)
+               for z in (-half.z, half.z)]
+    diag = max(max((p - center).length for p in corners), 1e-3)
+    pad = max(settings.frame_padding_factor, 1.0)
+    rx, ry = image_aspect(context.scene)
+    tan_x, tan_y = sensor_tangents(rx, ry)
 
     angle = FRONT_AXIS_ANGLES[settings.front_axis]
     views = list(VIEW_SETS[settings.view_set])
@@ -481,19 +820,54 @@ def build_cameras(context):
         views.append((cv.name, "ortho" if cv.is_ortho else "persp",
                       (cv.dir_x, cv.dir_y, cv.dir_z)))
 
+    # Pass 1: measure every view and take the worst case, so one ortho framing
+    # and one perspective framing cover the whole set. Sizing each camera to its
+    # own silhouette would frame tighter but make the product change apparent
+    # size from view to view, which defeats the point of a multiview sheet.
+    plan = []
+    skipped = []
+    ortho_scale = 0.0
+    persp_dist = 0.0
+    reach = -float("inf")
     for name, kind, direction in views:
-        d = Vector(rotate_dir_z(direction, angle)).normalized()
-        loc = center + d * distance
+        d = Vector(rotate_dir_z(direction, angle))
+        if d.length < 1e-9:
+            skipped.append(name)
+            continue
+        d.normalize()
+        ex, ey, depth, local = view_extents(look_at(center + d, center), center, corners)
+        reach = max(reach, depth)
+        if kind == "ortho":
+            ortho_scale = max(ortho_scale, 2.0 * pad * ortho_span(ex, ey, rx, ry))
+        else:
+            persp_dist = max(persp_dist, persp_distance(local, tan_x, tan_y, pad))
+        plan.append((name, kind, d))
+
+    if not plan:
+        return skipped
+    ortho_scale = max(ortho_scale, 1e-4)
+    ortho_dist = reach + diag
+    persp_dist = max(persp_dist, reach + diag * 0.1)
+
+    # Pass 2: build them on the shared framing.
+    for name, kind, d in plan:
         cam_data = bpy.data.cameras.new(f"MV_Cam_{name}")
         if kind == "ortho":
             cam_data.type = 'ORTHO'
             cam_data.ortho_scale = ortho_scale
+            distance = ortho_dist
         else:
             cam_data.type = 'PERSP'
-            cam_data.lens = 50.0
+            cam_data.lens = PERSP_LENS
+            distance = persp_dist
+        cam_data.clip_start = max(distance * 0.01, 1e-5)
+        cam_data.clip_end = (distance + diag) * 4.0
+
         cam_obj = bpy.data.objects.new(f"MV_Cam_{name}", cam_data)
-        cam_obj.matrix_world = look_at(loc, center)
+        cam_obj.matrix_world = look_at(center + d * distance, center)
         coll.objects.link(cam_obj)
+
+    return skipped
 
 
 def build_lighting(context, preset_key):
@@ -582,42 +956,206 @@ class MV_OT_ClearStepFiles(Operator):
 
 
 class MV_OT_ImportAllSteps(Operator):
+    """Import every STEP file in the list, one at a time.
+
+    Runs modally: the conversion subprocess is polled between timer ticks
+    instead of being waited on, so Blender keeps redrawing, the status bar
+    shows which file is in flight, and Esc aborts. Called from a script it
+    falls back to running straight through.
+    """
     bl_idname = "mv.import_all_steps"
     bl_label = "Import STEP Files"
+    bl_options = {'REGISTER', 'UNDO'}
 
-    def execute(self, context):
-        prefs = context.preferences.addons[__name__].preferences
+    def _setup(self, context):
         s = context.scene.mv_settings
         if not s.step_files:
             self.report({'ERROR'}, "No STEP files in the list.")
-            return {'CANCELLED'}
+            return False
+        self._prefs = context.preferences.addons[__name__].preferences
+        self._queue = [bpy.path.abspath(item.path) for item in s.step_files]
+        self._total = len(self._queue)
+        self._done = 0
+        self._imported = 0
+        self._problems = []
+        self._unbaked = set()
+        self._job = None
+        self._job_path = None
+        self._job_started = 0.0
+        self._before = set()
+        self._timer = None
+        self._cancelled = False
+        return True
 
+    # -- one file ---------------------------------------------------------
+    def _fail(self, path, reason):
+        self._problems.append(f"{os.path.basename(path)}: {reason}")
+        self._done += 1
+
+    def _link_new(self, context, path, new_objs):
         root = get_products_root()
-        imported = 0
-        for item in s.step_files:
-            path = bpy.path.abspath(item.path)
-            if not os.path.isfile(path):
-                self.report({'WARNING'}, f"Missing file: {path}")
-                continue
-            base = os.path.splitext(os.path.basename(path))[0]
-            product_coll = bpy.data.collections.get(base) or bpy.data.collections.new(base)
-            if product_coll.name not in root.children:
-                root.children.link(product_coll)
+        base = os.path.splitext(os.path.basename(path))[0]
+        product_coll = bpy.data.collections.get(base) or bpy.data.collections.new(base)
+        if product_coll.name not in root.children:
+            root.children.link(product_coll)
+        for obj in new_objs:
+            for c in list(obj.users_collection):
+                c.objects.unlink(obj)
+            product_coll.objects.link(obj)
 
-            new_objs = import_step(path, prefs)
-            if not new_objs:
-                self.report({'WARNING'}, f"Failed to import: {path}")
-                continue
-            for obj in new_objs:
-                for c in list(obj.users_collection):
-                    c.objects.unlink(obj)
-                product_coll.objects.link(obj)
-            imported += 1
+        s = context.scene.mv_settings
+        if s.fit_on_import:
+            context.view_layer.update()
+            if fit_collection(product_coll, s.target_size, recenter=True):
+                _, unbaked = bake_product(product_coll)
+                self._unbaked.update(unbaked)
+        self._imported += 1
+        self._done += 1
 
-        if not imported:
+    def _new_objects(self):
+        return [o for o in bpy.data.objects if o not in self._before]
+
+    def _start_file(self, context, path):
+        self._job_path = path
+        if not os.path.isfile(path):
+            self._fail(path, "file not found")
+            return
+        self._before = set(bpy.data.objects)
+        mode = self._prefs.step_import_mode
+
+        if mode in {'AUTO', 'STEPPER'} and try_stepper_import(path):
+            new = self._new_objects()
+            if new:
+                self._link_new(context, path, new)
+                return
+            if mode == 'STEPPER':
+                self._fail(path, "STEPper reported success but added no geometry")
+                return
+
+        if mode == 'STEPPER':
+            self._fail(path, "STEPper import failed")
+            return
+
+        job = freecad_prepare(path, self._prefs.freecad_path,
+                              self._prefs.tessellation_deflection)
+        if job is None:
+            self._fail(path, "no importer available (set the FreeCAD path in preferences)")
+            return
+        freecad_start(job)
+        self._job = job
+        self._job_started = time.monotonic()
+
+    def _collect_job(self, context):
+        job, self._job = self._job, None
+        path = self._job_path
+        obj_path, log = freecad_collect(job)
+        if obj_path and import_obj_file(obj_path):
+            new = self._new_objects()
+            if new:
+                self._link_new(context, path, new)
+            else:
+                self._fail(path, "converted mesh contained no geometry")
+        else:
+            tail = " ".join(log.split())[-160:]
+            self._fail(path, "FreeCAD conversion failed"
+                             + (f" - {tail}" if tail else " (no output)"))
+        freecad_cleanup(job)
+
+    # -- driver -----------------------------------------------------------
+    def _advance(self, context, blocking):
+        """One slice of work. False once everything is finished."""
+        if self._job is not None:
+            if blocking:
+                self._job["proc"].wait()
+            elif freecad_running(self._job):
+                if time.monotonic() - self._job_started > FREECAD_TIMEOUT:
+                    job, self._job = self._job, None
+                    freecad_cleanup(job)
+                    self._fail(self._job_path,
+                               f"FreeCAD exceeded {int(FREECAD_TIMEOUT)}s and was stopped")
+                return True
+            self._collect_job(context)
+            return bool(self._queue)
+        if not self._queue:
+            return False
+        self._start_file(context, self._queue.pop(0))
+        return True
+
+    def _status(self):
+        name = os.path.basename(self._job_path) if self._job_path else ""
+        waiting = " (converting)" if self._job is not None else ""
+        return f"MultiView: {self._done}/{self._total}  {name}{waiting}  -  Esc to cancel"
+
+    def _report_result(self):
+        if self._cancelled:
+            level, msg = {'WARNING'}, f"Import cancelled after {self._imported} file(s)."
+        elif not self._imported:
+            level, msg = {'ERROR'}, "Nothing imported."
+        else:
+            level, msg = {'INFO'}, f"Imported {self._imported} of {self._total} file(s)."
+        if self._unbaked:
+            msg += (f" {len(self._unbaked)} object(s) kept their transform "
+                    "(multi-user or linked data).")
+        if self._problems:
+            level = {'WARNING'} if self._imported else {'ERROR'}
+            msg += " " + " | ".join(self._problems[:2])
+            if len(self._problems) > 2:
+                msg += f" | +{len(self._problems) - 2} more (see system console)"
+            for problem in self._problems:
+                print("[MultiView] " + problem)
+        self.report(level, msg)
+        return {'FINISHED'} if self._imported else {'CANCELLED'}
+
+    def _teardown(self, context):
+        wm = context.window_manager
+        if self._timer is not None:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+        wm.progress_end()
+        try:
+            context.workspace.status_text_set(None)
+        except AttributeError:
+            pass
+        if self._job is not None:
+            freecad_cleanup(self._job)
+            self._job = None
+        return self._report_result()
+
+    # -- entry points -----------------------------------------------------
+    def execute(self, context):
+        if not self._setup(context):
             return {'CANCELLED'}
-        self.report({'INFO'}, f"Imported {imported} file(s).")
-        return {'FINISHED'}
+        while self._advance(context, blocking=True):
+            pass
+        return self._report_result()
+
+    def invoke(self, context, event):
+        if not self._setup(context):
+            return {'CANCELLED'}
+        wm = context.window_manager
+        wm.progress_begin(0, self._total)
+        self._timer = wm.event_timer_add(0.1, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type == 'ESC' and event.value == 'PRESS':
+            self._cancelled = True
+            return self._teardown(context)
+        if event.type != 'TIMER':
+            # Swallow everything else: the scene is mid-edit, so letting clicks
+            # through here would be a good way to corrupt it.
+            return {'RUNNING_MODAL'}
+
+        more = self._advance(context, blocking=False)
+        context.window_manager.progress_update(self._done)
+        try:
+            context.workspace.status_text_set(self._status())
+        except AttributeError:
+            pass
+        if not more:
+            return self._teardown(context)
+        return {'RUNNING_MODAL'}
 
 
 class MV_OT_ApplySceneSetup(Operator):
@@ -639,7 +1177,11 @@ class MV_OT_BuildCameras(Operator):
     bl_label = "Build Cameras"
 
     def execute(self, context):
-        build_cameras(context)
+        skipped = build_cameras(context)
+        if skipped:
+            self.report({'WARNING'},
+                        "Skipped custom view(s) with a zero direction vector: "
+                        + ", ".join(skipped))
         return {'FINISHED'}
 
 
@@ -686,6 +1228,7 @@ class MV_OT_RemoveCustomView(Operator):
 class MV_OT_Standardize(Operator):
     bl_idname = "mv.standardize"
     bl_label = "Standardize Products"
+    bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         s = context.scene.mv_settings
@@ -694,22 +1237,41 @@ class MV_OT_Standardize(Operator):
             self.report({'ERROR'}, "No products to standardize.")
             return {'CANCELLED'}
 
-        if not (s.recenter or s.rescale):
-            self.report({'WARNING'}, "Enable Recenter and/or Rescale first.")
+        if not (s.recenter or s.rescale or s.auto_smooth):
+            self.report({'WARNING'}, "Enable Recenter, Rescale or Auto Smooth first.")
             return {'CANCELLED'}
 
-        if s.recenter:
-            for pc in products:
-                recenter_collection(pc)
+        context.view_layer.update()
+        done = 0
+        unbaked = set()
+        smoothed = 0
+        for pc in products:
+            if s.recenter or s.rescale:
+                if fit_collection(pc,
+                                  target_size=s.target_size if s.rescale else None,
+                                  recenter=s.recenter):
+                    done += 1
+                    _, skipped_objs = bake_product(pc,
+                                                   apply_scale=s.rescale,
+                                                   origin_to_world=s.recenter)
+                    unbaked.update(skipped_objs)
+            elif collection_meshes(pc):
+                done += 1
+            if s.auto_smooth:
+                shaded, skipped_objs = smooth_product(pc, s.smooth_angle)
+                smoothed += len(shaded)
+                unbaked.update(skipped_objs)
 
-        if s.rescale:
-            target = max(s.target_size, 1e-6)
-            for pc in products:
-                cur = collection_max_dim(pc)
-                if cur > 0:
-                    scale_collection(pc, target / cur)
-
-        self.report({'INFO'}, f"Standardized {len(products)} product(s).")
+        empty = len(products) - done
+        msg = f"Standardized {done} product(s)."
+        if s.auto_smooth:
+            msg += f" Smoothed {smoothed} mesh(es)."
+        if empty:
+            msg += f" Skipped {empty} with no geometry."
+        if unbaked:
+            msg += (f" {len(unbaked)} object(s) kept their transform "
+                    "(multi-user or linked data).")
+        self.report({'INFO'} if not unbaked else {'WARNING'}, msg)
         return {'FINISHED'}
 
 
@@ -948,12 +1510,18 @@ class MV_PT_Import(Panel):
         layout.separator()
         box = layout.box()
         box.label(text="Standardization:")
+        box.prop(s, "fit_on_import")
         row = box.row(align=True)
         row.prop(s, "recenter", toggle=True)
         row.prop(s, "rescale", toggle=True)
         sub = box.row()
-        sub.enabled = s.rescale
+        sub.enabled = s.rescale or s.fit_on_import
         sub.prop(s, "target_size")
+        row = box.row(align=True)
+        row.prop(s, "auto_smooth", toggle=True)
+        sub = row.row()
+        sub.enabled = s.auto_smooth
+        sub.prop(s, "smooth_angle", text="")
         box.operator("mv.standardize", icon='FULLSCREEN_EXIT')
 
 
